@@ -60,6 +60,7 @@ class SeaCacheRootHook(ModelHook):
         current_sigma_callback: Callable[[], float | torch.Tensor | None] | None = None,
         num_inference_steps_callback: Callable[[], int | torch.Tensor | None] | None = None,
         extractor_fn: Callable[..., CacheContext] | None = None,
+        memory_pool_context_fn: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -71,6 +72,7 @@ class SeaCacheRootHook(ModelHook):
         self.full_count = 0
         self.skip_count = 0
         self.extractor_fn = extractor_fn
+        self.memory_pool_context_fn = memory_pool_context_fn
         self._parameter_sharded = False
         self._collective_skip_groups: list[torch.distributed.ProcessGroup] = []
 
@@ -92,6 +94,13 @@ class SeaCacheRootHook(ModelHook):
         if message not in self._warned_messages:
             logger.warning(message)
             self._warned_messages.add(message)
+
+    def _cache_memory_context(self):
+        if self.memory_pool_context_fn is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return self.memory_pool_context_fn("cache")
 
     @contextmanager
     def cache_context(self, name: str) -> Iterator[None]:
@@ -128,13 +137,15 @@ class SeaCacheRootHook(ModelHook):
         for batch_index in range(hidden_states.shape[0]):
             for latent in vision_items:
                 thwc = latent[batch_index].movedim(0, -1)
-                indicator.append(
-                    apply_sea_filter(
-                        thwc,
-                        sigma=sigma,
-                        power_exp=self.config.power_exp,
-                    ).detach()
-                )
+                filtered = apply_sea_filter(
+                    thwc,
+                    sigma=sigma,
+                    power_exp=self.config.power_exp,
+                ).detach()
+                # Only the retained indicator is allocated in the cache pool;
+                # FFT/filter temporaries remain ordinary request allocations.
+                with self._cache_memory_context():
+                    indicator.append(filtered.clone())
         return indicator or None
 
     def _resolve_gate(
@@ -357,7 +368,11 @@ class SeaCacheRootHook(ModelHook):
             and output.device == execution_input.device
             and output.dtype == execution_input.dtype
         ):
-            state.history.append((step, (output - execution_input).detach().clone()))
+            residual = (output - execution_input).detach()
+            # The history outlives this forward; tag only its retained clone.
+            with self._cache_memory_context():
+                cached_residual = residual.clone()
+            state.history.append((step, cached_residual))
             state.history = state.history[-(self.config.residual_order + 1) :]
             state.consecutive_cached = 0
             return
@@ -384,6 +399,7 @@ def apply_sea_cache_hook(
     current_sigma_callback: Callable[[], float | torch.Tensor | None] | None = None,
     num_inference_steps_callback: Callable[[], int | torch.Tensor | None] | None = None,
     extractor_fn: Callable[..., CacheContext] | None = None,
+    memory_pool_context_fn: Callable[[str], Any] | None = None,
 ) -> SeaCacheRootHook:
     registry = HookRegistry.get_or_create(module)
     hook = SeaCacheRootHook(
@@ -392,6 +408,7 @@ def apply_sea_cache_hook(
         current_sigma_callback=current_sigma_callback,
         num_inference_steps_callback=num_inference_steps_callback,
         extractor_fn=extractor_fn,
+        memory_pool_context_fn=memory_pool_context_fn,
     )
     registry.register_hook(SeaCacheRootHook._HOOK_NAME, hook)
     return hook

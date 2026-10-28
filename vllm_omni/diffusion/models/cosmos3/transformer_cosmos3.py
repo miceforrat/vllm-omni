@@ -1446,6 +1446,9 @@ class Cosmos3VFMTransformer(nn.Module):
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._cache_memory_pool_context_fn = None
+        self._und_cache_persistent_tensors = 0
+        self._und_cache_persistent_tensor_bytes = 0
 
         self._model_cpu_offload_enabled = False
         self._model_cpu_offload_device: torch.device | None = None
@@ -1745,6 +1748,42 @@ class Cosmos3VFMTransformer(nn.Module):
     def reset_cache(self) -> None:
         self.cached_kv = None
         self.cached_freqs_gen = None
+
+    def _retain_und_cache(
+        self,
+        cached_kv_full: list[tuple[torch.Tensor, torch.Tensor]],
+        freqs_gen: tuple[torch.Tensor, torch.Tensor],
+        max_real_len: int,
+    ) -> None:
+        """Retain request-scoped UND state in an optional runtime-owned pool."""
+        context_fn = self._cache_memory_pool_context_fn
+        if context_fn is None:
+            # Preserve the original Omni behavior when no owner injects a pool.
+            self.cached_kv = [
+                (k[:, :max_real_len], v[:, :max_real_len])
+                for k, v in cached_kv_full
+            ]
+            self.cached_freqs_gen = freqs_gen
+        else:
+            with context_fn("und_cache"):
+                # The source tensors include padding and are ordinary forward
+                # allocations. Copies give the retained cache independent,
+                # precisely-sized storage owned by the selected cache pool.
+                self.cached_kv = [
+                    (
+                        k[:, :max_real_len].contiguous().clone(),
+                        v[:, :max_real_len].contiguous().clone(),
+                    )
+                    for k, v in cached_kv_full
+                ]
+                self.cached_freqs_gen = tuple(freq.clone() for freq in freqs_gen)
+
+        retained = [tensor for pair in self.cached_kv for tensor in pair]
+        retained.extend(self.cached_freqs_gen)
+        self._und_cache_persistent_tensors = len(retained)
+        self._und_cache_persistent_tensor_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in retained
+        )
 
     def sound_latent_frames_for_sequence_parallel(
         self,
@@ -2062,14 +2101,17 @@ class Cosmos3VFMTransformer(nn.Module):
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
-            self.cached_freqs_gen = freqs_gen
-
             if need_kv:
                 with self._offload_context("reasoner"):
                     cached_kv_full = self.language_model(text_ids, freqs_und)
-                # Trim to real text length (remove padding).  K/V stay replicated;
-                # the framework Attention layer head-slices them via joint_key/value.
-                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+                self._retain_und_cache(cached_kv_full, freqs_gen, max_real_len)
+            else:
+                context_fn = self._cache_memory_pool_context_fn
+                if context_fn is None:
+                    self.cached_freqs_gen = freqs_gen
+                else:
+                    with context_fn("und_cache"):
+                        self.cached_freqs_gen = tuple(freq.clone() for freq in freqs_gen)
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache

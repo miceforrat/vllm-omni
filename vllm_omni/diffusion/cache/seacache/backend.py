@@ -42,6 +42,9 @@ def enable_cosmos3_seacache(
             "num_timesteps",
             None,
         ),
+        memory_pool_context_fn=getattr(
+            pipeline, "_cache_memory_pool_context_fn", None
+        ),
     )
     logger.info(
         "SeaCache enabled for %s (threshold=%s, residual_order=%d, max_consecutive_cached=%d, power_exp=%s)",

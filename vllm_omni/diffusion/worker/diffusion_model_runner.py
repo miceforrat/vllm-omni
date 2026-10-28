@@ -420,6 +420,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     current_omni_platform.get_torch_device(),
                 )
 
+        # Cache backends create persistent runtime tensors after model loading.
+        # Expose the Worker-provided pool factory without coupling the pipeline
+        # to a concrete allocator implementation.
+        self.pipeline._cache_memory_pool_context_fn = memory_pool_context_fn
+        for module_name in getattr(self.pipeline, "_dit_modules", ("transformer",)):
+            module = getattr(self.pipeline, module_name, None)
+            if module is not None:
+                module._cache_memory_pool_context_fn = memory_pool_context_fn
+
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
@@ -633,6 +642,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
         peak_allocated_bytes = current_omni_platform.max_memory_allocated()
+        # Expose the most recent request peak to embedded runtimes without
+        # changing the public diffusion output schema.
+        self._last_peak_reserved_bytes = int(peak_reserved_bytes)
+        self._last_peak_allocated_bytes = int(peak_allocated_bytes)
 
         pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
 
