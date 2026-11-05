@@ -15,7 +15,8 @@ import gc
 import math
 import time
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -74,6 +75,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.runtime_providers import DiffusionRuntimeProviders
 from vllm_omni.diffusion.worker.stage_payload import DiffusionStagePayloadMixin
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
@@ -158,6 +160,18 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
+def _with_runtime_providers(method):
+    """Enter model-scoped runtime resources around one execution slice."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        requests = args[0] if args else kwargs.get("reqs")
+        with self._runtime_execution_context(requests):
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
@@ -191,6 +205,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.input_batch: InputBatch | None = None
         self._interaction_coordinator: InteractionCoordinator | None = None
         self.model_memory_usage = 0
+        self.runtime_providers: DiffusionRuntimeProviders | None = None
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
             vllm_config=vllm_config,
             od_config=od_config,
@@ -297,6 +312,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
         initialize_lora: Callable[[], None] | None = None,
+        runtime_providers: DiffusionRuntimeProviders | None = None,
     ) -> None:
         """
         Launch the diffusion pipeline, applying compilation, offloading, and caching.
@@ -310,7 +326,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 - "dummy": Skip actual weight loading, useful for testing and custom pipelines that
                     don't require default weights.
             custom_pipeline_name: Optional custom pipeline class name to use.
+            runtime_providers: Optional model-scoped memory, stream, phase,
+                and communicator providers supplied by the owning runtime.
         """
+
+        if memory_pool_context_fn is not None and runtime_providers is not None:
+            if runtime_providers.memory is not None:
+                raise ValueError(
+                    "Specify either memory_pool_context_fn or a runtime memory "
+                    "provider, not both"
+                )
+        self.runtime_providers = runtime_providers
 
         if load_format == "dummy":
             return
@@ -344,6 +370,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         load_device = "cpu" if offload_enabled(self.od_config) else str(self.device)
 
         def get_memory_context() -> AbstractContextManager[Any]:
+            if runtime_providers is not None and runtime_providers.memory is not None:
+                return runtime_providers.memory.allocation_context("weights")
             if memory_pool_context_fn is not None:
                 return memory_pool_context_fn("weights")
             return nullcontext()
@@ -423,11 +451,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # Cache backends create persistent runtime tensors after model loading.
         # Expose the Worker-provided pool factory without coupling the pipeline
         # to a concrete allocator implementation.
-        self.pipeline._cache_memory_pool_context_fn = memory_pool_context_fn
+        cache_memory_context_fn = memory_pool_context_fn
+        if runtime_providers is not None and runtime_providers.memory is not None:
+            cache_memory_context_fn = runtime_providers.memory.allocation_context
+        self.pipeline._cache_memory_pool_context_fn = cache_memory_context_fn
         for module_name in getattr(self.pipeline, "_dit_modules", ("transformer",)):
             module = getattr(self.pipeline, module_name, None)
             if module is not None:
-                module._cache_memory_pool_context_fn = memory_pool_context_fn
+                module._cache_memory_pool_context_fn = cache_memory_context_fn
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
@@ -471,7 +502,33 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if hasattr(self.pipeline, "_interaction_coordinator"):
             self.pipeline._interaction_coordinator = self._interaction_coordinator
 
+        if runtime_providers is not None and runtime_providers.phase is not None:
+            runtime_providers.phase.install(self.pipeline)
+
         logger.info("Model runner: Initialization complete.")
+
+    @contextmanager
+    def _runtime_execution_context(self, requests: Any | None = None):
+        providers = getattr(self, "runtime_providers", None)
+        if providers is None:
+            yield
+            return
+        with ExitStack() as stack:
+            if providers.communicator is not None:
+                stack.enter_context(
+                    providers.communicator.communication_context()
+                )
+            if providers.stream is not None:
+                stack.enter_context(providers.stream.execution_context())
+            if providers.phase is not None:
+                stack.enter_context(providers.phase.request_context(requests))
+            yield
+
+    def release_runtime_providers(self) -> None:
+        providers = getattr(self, "runtime_providers", None)
+        if providers is not None and providers.phase is not None:
+            providers.phase.uninstall()
+        self.runtime_providers = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Collect native specs from cache-enabled loaded attention modules."""
@@ -787,6 +844,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ]
         )
 
+    @_with_runtime_providers
     def _execute_request_list(
         self,
         reqs: list[OmniDiffusionRequest],
