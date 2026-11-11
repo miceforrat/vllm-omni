@@ -29,6 +29,7 @@ is produced from sound latents rather than from ``multi_modal_data["audio"]``.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -43,6 +44,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
+from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from torch import nn
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
@@ -547,6 +549,12 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        # Engine 启动 warmup 会为支持图像输入的模型构造带空白图像的 dummy
+        # request。它并不代表真实 I2V 请求，且只用于预热原有完整 forward；
+        # 因此不要让它进入目前仅支持标准 T2I/T2V 的分步执行路径。
+        if request.is_dummy_run():
+            request.use_step_execution = False
+
         action_mode = _request_action_mode(request)
         prompt = request.prompt
         if is_guardrails_enabled(od_config, request.sampling_params):
@@ -976,6 +984,10 @@ class Cosmos3OmniDiffusersPipeline(
     """
 
     support_image_input: ClassVar[bool] = True
+    supports_step_execution: ClassVar[bool] = True
+    # 通用 memory-profile dummy 带有 image 条件，不属于第一版状态机支持的
+    # 标准 T2I/T2V 请求；启动 profiling 继续走原始完整 forward。
+    step_profile_uses_request_mode: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
@@ -3792,6 +3804,429 @@ class Cosmos3OmniDiffusersPipeline(
             },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
+
+    # -- 显式 step execution -------------------------------------------------
+
+    @staticmethod
+    def _step_mode_is_t2i(prompt_data: Any) -> bool:
+        """从单请求 prompt 中解析标准 T2I/T2V 模式。"""
+        modalities = (
+            prompt_data.get("modalities", [])
+            if isinstance(prompt_data, dict)
+            else []
+        )
+        if modalities is None:
+            modalities = []
+        if isinstance(modalities, str):
+            modalities = [modalities]
+        if "image" in modalities and "video" in modalities:
+            raise ValueError(
+                "Cosmos3 prompt modalities cannot request both image and video"
+            )
+        return "image" in modalities
+
+    def prepare_encode(self, state: Any, **kwargs: Any) -> Any:
+        """复制标准 T2I/T2V 的 preparation，并保存跨 step 状态。
+
+        Action、sound、transfer 以及带媒体条件的请求暂时继续使用原始
+        ``forward``，避免第一版状态机悄悄改变这些分支的语义。
+        """
+        del kwargs
+        prompt_data = state.prompt if state.prompt is not None else ""
+        sp = state.sampling
+        prompt = (
+            prompt_data
+            if isinstance(prompt_data, str)
+            else prompt_data.get("prompt", "")
+        )
+        negative_prompt = (
+            None
+            if isinstance(prompt_data, str)
+            else prompt_data.get("negative_prompt")
+        )
+        additional = (
+            {}
+            if isinstance(prompt_data, str)
+            else prompt_data.get("additional_information", {}) or {}
+        )
+        unsupported_media = {
+            name: additional.get(name)
+            for name in (
+                "preprocessed_image",
+                "preprocessed_video",
+                "preprocessed_transfer_video",
+            )
+            if additional.get(name) is not None
+        }
+        if unsupported_media:
+            raise ValueError(
+                "Cosmos3 step execution currently supports standard T2I/T2V "
+                f"only; media inputs are unsupported: {tuple(unsupported_media)}"
+            )
+        if self._is_sound_request(prompt_data, sp):
+            raise ValueError(
+                "Cosmos3 sound requests must use the original request-mode forward"
+            )
+        if self._get_action_mode(prompt_data, sp) is not None:
+            raise ValueError(
+                "Cosmos3 action requests must use the original request-mode forward"
+            )
+        if resolve_transfer_config(sp, prompt_data) is not None:
+            raise ValueError(
+                "Cosmos3 transfer requests must use the original request-mode forward"
+            )
+        if self._cfg_parallel_active():
+            raise ValueError(
+                "Cosmos3 CFG-parallel requests must use the original "
+                "request-mode forward in the first step-execution version"
+            )
+
+        is_t2i = self._step_mode_is_t2i(prompt_data)
+        negative_prompt = negative_prompt or ""
+        if is_t2i:
+            height = sp.height or (
+                COSMOS3_EDGE_T2I_DEFAULT_HEIGHT
+                if self.is_edge_model
+                else COSMOS3_T2I_DEFAULT_HEIGHT
+            )
+            width = sp.width or (
+                COSMOS3_EDGE_T2I_DEFAULT_WIDTH
+                if self.is_edge_model
+                else COSMOS3_T2I_DEFAULT_WIDTH
+            )
+            num_frames = 1
+            num_steps = (
+                sp.num_inference_steps
+                or COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS
+            )
+            guidance_scale = self._resolve_guidance_scale(
+                sp, COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE
+            )
+            flow_shift = COSMOS3_T2I_DEFAULT_FLOW_SHIFT
+            guidance_interval: tuple[float, float] | None = (
+                COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL
+            )
+        else:
+            height = sp.height or (
+                COSMOS3_EDGE_T2V_DEFAULT_HEIGHT
+                if self.is_edge_model
+                else COSMOS3_T2V_DEFAULT_HEIGHT
+            )
+            width = sp.width or (
+                COSMOS3_EDGE_T2V_DEFAULT_WIDTH
+                if self.is_edge_model
+                else COSMOS3_T2V_DEFAULT_WIDTH
+            )
+            num_frames = sp.num_frames or COSMOS3_T2V_DEFAULT_NUM_FRAMES
+            num_frames = _ceil_video_num_frames(
+                int(num_frames), self.vae_scale_factor_temporal
+            )
+            num_steps = (
+                sp.num_inference_steps
+                or COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS
+            )
+            default_guidance = (
+                COSMOS3_EDGE_T2V_DEFAULT_GUIDANCE_SCALE
+                if self.is_edge_model
+                else COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE
+            )
+            guidance_scale = self._resolve_guidance_scale(sp, default_guidance)
+            flow_shift = self._engine_init_flow_shift
+            guidance_interval = None
+
+        flow_shift = float(self._get_sp_param(sp, "flow_shift", flow_shift))
+        guidance_interval = self._get_sp_param(
+            sp, "guidance_interval", guidance_interval
+        )
+        frame_rate = (
+            self._get_sp_param(sp, "resolved_frame_rate")
+            or self._get_sp_param(sp, "frame_rate")
+            or 24.0
+        )
+        max_sequence_length = (
+            self._get_sp_param(
+                sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+            )
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(
+            self._get_sp_param(sp, "use_system_prompt", False)
+        )
+        generator = sp.generator
+        seed = self._resolve_seed(sp, generator)
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        cond_ids, cond_mask, uncond_ids, uncond_mask = (
+            self._format_and_tokenize_prompts(
+                prompt,
+                negative_prompt,
+                num_frames,
+                frame_rate,
+                height,
+                width,
+                max_sequence_length,
+                sp,
+                use_system_prompt,
+                is_t2i=is_t2i,
+            )
+        )
+        latents = self._prepare_latents(
+            height, width, num_frames, generator
+        )
+        video_shape = tuple(int(size) for size in latents.shape[2:])
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_steps
+        self._set_flow_shift(flow_shift)
+        self._set_timesteps(num_steps, self.device, flow_shift)
+        request_scheduler = copy.deepcopy(self.scheduler)
+
+        # Cosmos3 Edge 的 UND 输入是 token IDs，而通用 InputBatch 会把
+        # ``prompt_embeds`` 解释为 [B, S, H] embedding 并规范化维度。
+        # 将 token IDs 保存在请求私有状态中，避免批处理层为其额外增加
+        # 一维，最终使语言塔收到 [B, *, S, H]。
+        state.prompt_embeds = None
+        state.prompt_embeds_mask = None
+        state.negative_prompt_embeds = None
+        state.negative_prompt_embeds_mask = None
+        state.latents = latents
+        state.timesteps = request_scheduler.timesteps
+        state.scheduler = request_scheduler
+        state.step_index = 0
+        state.do_true_cfg = guidance_scale > 1.0
+        state.extra.update(
+            {
+                "is_t2i": is_t2i,
+                "height": int(height),
+                "width": int(width),
+                "frame_rate": float(frame_rate),
+                "guidance_scale": float(guidance_scale),
+                "guidance_interval": guidance_interval,
+                "video_shape": video_shape,
+                "generator": generator,
+                "cond_ids": cond_ids,
+                "cond_mask": cond_mask,
+                "uncond_ids": uncond_ids,
+                "uncond_mask": uncond_mask,
+                "cond_cache": (None, None),
+                "uncond_cache": (None, None),
+                "kv_state": self._new_cosmos3_state(state.request_id),
+            }
+        )
+        self._kv_reset_und(state.extra["kv_state"])
+        return state
+
+    @staticmethod
+    def _step_cfg_is_active(state: Any, timestep: torch.Tensor) -> bool:
+        interval = state.extra["guidance_interval"]
+        if interval is None:
+            return True
+        value = float(timestep.item())
+        return float(interval[0]) <= value <= float(interval[1])
+
+    def denoise_step(
+        self,
+        input_batch: Any,
+        *,
+        states: Any | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """执行一个标准 Cosmos3 denoising forward。"""
+        del kwargs
+        states = tuple(states or input_batch.states)
+        if len(states) != 1:
+            raise ValueError(
+                "Cosmos3 step execution currently supports one request per batch"
+            )
+        state = states[0]
+        t = state.current_timestep
+        if t is None or state.latents is None:
+            raise RuntimeError("Cosmos3 step state has no runnable timestep")
+        self._set_denoise_step_metadata(
+            state.step_index, state.timesteps, state.scheduler
+        )
+        self._set_mixed_precision_step(state.step_index, state.total_steps)
+        timestep = t.unsqueeze(0)
+        common = {
+            "hidden_states": state.latents,
+            "timestep": timestep,
+            "video_shape": state.extra["video_shape"],
+            "fps": state.extra["frame_rate"],
+        }
+        kv_state = state.extra["kv_state"]
+        if not self._kv_load_und(kv_state, is_negative=False):
+            (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+            ) = state.extra["cond_cache"]
+        noise_cond = self.predict_noise(
+            _cache_context="cond",
+            text_ids=state.extra["cond_ids"],
+            text_mask=state.extra["cond_mask"],
+            **common,
+        )
+        self._kv_capture_und(kv_state, is_negative=False)
+        if kv_state is None and state.extra["cond_cache"][0] is None:
+            state.extra["cond_cache"] = (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+            )
+        if not state.do_true_cfg:
+            return noise_cond
+
+        cfg_active = self._step_cfg_is_active(state, t)
+        keep_uncond = self._cache_requires_paired_cfg()
+        if not cfg_active and not keep_uncond:
+            return noise_cond
+        if not self._kv_load_und(kv_state, is_negative=True):
+            (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+            ) = state.extra["uncond_cache"]
+        noise_uncond = self.predict_noise(
+            _cache_context="uncond",
+            text_ids=state.extra["uncond_ids"],
+            text_mask=state.extra["uncond_mask"],
+            **common,
+        )
+        self._kv_capture_und(kv_state, is_negative=True)
+        if kv_state is None and state.extra["uncond_cache"][0] is None:
+            state.extra["uncond_cache"] = (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+            )
+        scale = state.extra["guidance_scale"] if cfg_active else 1.0
+        return self.combine_cfg_noise(
+            noise_cond, noise_uncond, scale, cfg_normalize=False
+        )
+
+    def step_scheduler(
+        self,
+        state: Any,
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        """更新请求 latents，并推进一个 timestep。"""
+        del kwargs
+        t = state.current_timestep
+        if t is None or state.latents is None or state.scheduler is None:
+            raise RuntimeError("Cosmos3 step state is incomplete")
+        state.latents = state.scheduler.step(
+            noise_pred,
+            t,
+            state.latents,
+            generator=state.extra["generator"],
+            return_dict=False,
+        )[0]
+        state.step_index += 1
+
+    def prepare_vae_blocks(self, state: Any) -> None:
+        """准备可恢复的 Wan VAE temporal-block decode 状态。"""
+        if state.latents is None:
+            raise RuntimeError("Cosmos3 step state has no final latents")
+        latents = state.latents.to(self.vae.dtype)
+        if hasattr(self.vae.config, "latents_mean") and hasattr(
+            self.vae.config, "latents_std"
+        ):
+            mean, std = self._get_latents_mean_std(
+                latents.device, latents.dtype
+            )
+            latents = latents * std + mean
+        else:
+            latents = latents / getattr(
+                self.vae.config, "scaling_factor", 1.0
+            )
+
+        tile_h = (
+            self.vae.tile_sample_min_height
+            // self.vae.spatial_compression_ratio
+        )
+        tile_w = (
+            self.vae.tile_sample_min_width
+            // self.vae.spatial_compression_ratio
+        )
+        if getattr(self.vae, "use_tiling", False) and (
+            latents.shape[-2] > tile_h or latents.shape[-1] > tile_w
+        ):
+            raise ValueError(
+                "Explicit Cosmos3 vae_blocks do not yet support tiled decode"
+            )
+        self.vae.clear_cache()
+        with self.vae._execution_context():
+            projected = self.vae.post_quant_conv(latents)
+        state.extra.update(
+            {
+                "vae_projected": projected,
+                "vae_block_index": 0,
+                "vae_block_count": int(projected.shape[2]),
+                "vae_decoded_chunks": [],
+            }
+        )
+
+    def run_vae_block(self, state: Any) -> bool:
+        """推进一个 temporal decoder block，返回 VAE 是否完成。"""
+        projected = state.extra.get("vae_projected")
+        if projected is None:
+            raise RuntimeError("Cosmos3 VAE block state is not prepared")
+        index = int(state.extra["vae_block_index"])
+        count = int(state.extra["vae_block_count"])
+        if index >= count:
+            return True
+        self.vae._conv_idx = [0]
+        kwargs: dict[str, Any] = {
+            "feat_cache": self.vae._feat_map,
+            "feat_idx": self.vae._conv_idx,
+        }
+        if index == 0:
+            kwargs["first_chunk"] = True
+        with self.vae._execution_context():
+            chunk = self.vae.decoder(
+                projected[:, :, index : index + 1], **kwargs
+            )
+        state.extra["vae_decoded_chunks"].append(chunk)
+        state.extra["vae_block_index"] = index + 1
+        return index + 1 >= count
+
+    def finalize_vae_blocks(self, state: Any) -> DiffusionOutput:
+        """合并 VAE blocks、恢复输出格式并释放请求级缓存。"""
+        try:
+            chunks = state.extra.get("vae_decoded_chunks")
+            if not chunks or int(state.extra["vae_block_index"]) < int(
+                state.extra["vae_block_count"]
+            ):
+                raise RuntimeError("Cosmos3 VAE blocks are not complete")
+            video = torch.cat(chunks, dim=2)
+            if self.vae.config.patch_size is not None:
+                video = unpatchify(
+                    video, patch_size=self.vae.config.patch_size
+                )
+            video = torch.clamp(video, min=-1.0, max=1.0)
+            return _cosmos3_media_output(
+                output={"image": video}
+                if state.extra["is_t2i"]
+                else {"video": video},
+                od_config=self.od_config,
+                sampling_params=state.sampling,
+                stage_durations=(
+                    self.stage_durations
+                    if hasattr(self, "stage_durations")
+                    else None
+                ),
+            )
+        finally:
+            self.vae.clear_cache()
+            self._clear_denoise_step_metadata()
+            self._reset_mixed_precision()
+            if state.extra.get("kv_state") is not None:
+                self._memory_manager.drop_session(state.request_id)
+
+    def post_decode(self, state: Any, **kwargs: Any) -> DiffusionOutput:
+        """兼容 Omni 原生 step runner：连续消费全部 VAE blocks。"""
+        del kwargs
+        self.prepare_vae_blocks(state)
+        while not self.run_vae_block(state):
+            pass
+        return self.finalize_vae_blocks(state)
 
     # -- Forward (main generation entry point) -------------------------------
 

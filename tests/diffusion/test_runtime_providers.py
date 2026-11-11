@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 
+from vllm_omni.diffusion.distributed import parallel_state
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.runtime_providers import DiffusionRuntimeProviders
 
@@ -33,6 +34,34 @@ class _ContextProvider:
 
     def uninstall(self) -> None:
         self.uninstalled = True
+
+
+class _ParallelGroupProvider:
+    def __init__(self, groups):
+        self.groups = groups
+
+    def get(self, parallel_dimension):
+        return self.groups.get(parallel_dimension)
+
+
+def test_parallel_group_provider_overrides_only_provided_dimensions() -> None:
+    original_world = parallel_state._WORLD
+    original_pp = parallel_state._PP
+    fallback_world = object()
+    fallback_pp = object()
+    provided_world = object()
+    parallel_state._WORLD = fallback_world
+    parallel_state._PP = fallback_pp
+    provider = _ParallelGroupProvider({"world": provided_world})
+
+    try:
+        with parallel_state.use_parallel_group_provider(provider):
+            assert parallel_state.get_world_group() is provided_world
+            assert parallel_state.get_pp_group() is fallback_pp
+        assert parallel_state.get_world_group() is fallback_world
+    finally:
+        parallel_state._WORLD = original_world
+        parallel_state._PP = original_pp
 
 
 def test_runtime_provider_contexts_are_nested_in_resource_order() -> None:

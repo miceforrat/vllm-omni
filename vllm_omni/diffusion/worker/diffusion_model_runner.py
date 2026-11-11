@@ -524,6 +524,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 stack.enter_context(providers.phase.request_context(requests))
             yield
 
+    def _model_execution_context(
+        self, od_config: OmniDiffusionConfig | None = None
+    ) -> AbstractContextManager[Any]:
+        """返回与标准执行路径一致的推理模式上下文。"""
+        config = self.od_config if od_config is None else od_config
+        use_hsdp = config.parallel_config.use_hsdp
+        use_distributed_offload = (
+            resolve_offload_strategy(config)
+            is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        )
+        if use_hsdp or use_distributed_offload:
+            return torch.no_grad()
+        return torch.inference_mode()
+
     def release_runtime_providers(self) -> None:
         providers = getattr(self, "runtime_providers", None)
         if providers is not None and providers.phase is not None:
@@ -867,13 +881,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
 
-        # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
-        # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
-        # counters, which inference tensors do not track.
-        use_hsdp = od_config.parallel_config.use_hsdp
-        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
-        grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
-        with grad_context:
+        with self._model_execution_context(od_config):
             for req in reqs:
                 self._prepare_request_for_forward(
                     req,
@@ -1083,7 +1091,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         runner_output: BatchRunnerOutput | None = None
         request_ids = [request.request_id for request in requests]
         try:
-            if getattr(self.od_config, "step_execution", False):
+            step_profile = bool(
+                getattr(self.od_config, "step_execution", False)
+            ) and not bool(
+                getattr(
+                    self.pipeline,
+                    "step_profile_uses_request_mode",
+                    False,
+                )
+            )
+            if step_profile:
                 scheduler_output = DiffusionSchedulerOutput(
                     step_id=0,
                     scheduled_new_reqs=[
@@ -1171,6 +1188,114 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     def _supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
+
+    def prepare_explicit_request(
+        self, req: OmniDiffusionRequest
+    ) -> StepRequestState:
+        """显式创建请求状态，但不执行第一个 denoising step。
+
+        该接口供外部 ExecUnit 使用。原生 diffusion engine 的批调度路径仍
+        使用 ``execute_stepwise``，因此不会改变已有 serving 行为。
+        """
+        if not self._supports_step_mode():
+            raise ValueError("Current pipeline does not support step execution")
+        if req.request_id in self.state_cache:
+            raise ValueError(
+                f"Duplicate explicit request {req.request_id!r}"
+            )
+        pipeline = self.pipeline
+        assert pipeline is not None
+        state = StepRequestState(
+            request_id=req.request_id,
+            sampling=copy.deepcopy(req.sampling_params),
+            prompt=req.prompt,
+            kv_sender_info=req.kv_sender_info,
+            prepared_layout=getattr(req, "prepared_layout", None),
+            external_req_id=getattr(req, "external_req_id", None),
+        )
+        state_req = copy.copy(req)
+        state_req.sampling_params = state.sampling
+        try:
+            with self._model_execution_context():
+                with self._runtime_execution_context([req]):
+                    self._initialize_generator(state.sampling)
+                    pipeline.prepare_encode(state)
+            self.state_cache[state.request_id] = state
+            return state
+        except Exception:
+            self.state_cache.pop(state.request_id, None)
+            raise
+
+    def execute_explicit_denoising_step(
+        self, state: StepRequestState
+    ) -> StepRequestState:
+        """只推进一个 denoising step，并保留请求状态。"""
+        if self.state_cache.get(state.request_id) is not state:
+            raise ValueError(
+                f"Unknown explicit request state {state.request_id!r}"
+            )
+        if state.denoise_completed:
+            raise RuntimeError(
+                f"Request {state.request_id!r} has completed denoising"
+            )
+        pipeline = self.pipeline
+        assert pipeline is not None
+        input_batch = InputBatch.make_batch([state])
+        with self._model_execution_context():
+            with self._runtime_execution_context([state]):
+                with set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata={},
+                ):
+                    noise_pred = pipeline.denoise_step(
+                        input_batch, states=[state]
+                    )
+                    if noise_pred is None:
+                        raise RuntimeError(
+                            "Explicit Cosmos3 denoising returned no prediction"
+                        )
+                    pipeline.step_scheduler(state, noise_pred)
+        return state
+
+    def prepare_explicit_vae_blocks(self, state: StepRequestState) -> None:
+        """初始化显式 VAE block 状态，但不执行 decoder。"""
+        if self.state_cache.get(state.request_id) is not state:
+            raise ValueError(
+                f"Unknown explicit request state {state.request_id!r}"
+            )
+        if not state.denoise_completed:
+            raise RuntimeError(
+                f"Request {state.request_id!r} has unfinished denoising"
+            )
+        pipeline = self.pipeline
+        assert pipeline is not None
+        with self._model_execution_context():
+            with self._runtime_execution_context([state]):
+                pipeline.prepare_vae_blocks(state)
+
+    def execute_explicit_vae_block(self, state: StepRequestState) -> bool:
+        """推进一个 VAE temporal block，返回是否完成。"""
+        pipeline = self.pipeline
+        assert pipeline is not None
+        with self._model_execution_context():
+            with self._runtime_execution_context([state]):
+                return bool(pipeline.run_vae_block(state))
+
+    def finalize_explicit_vae_blocks(
+        self, state: StepRequestState
+    ) -> DiffusionOutput:
+        """合并显式 VAE blocks 并释放 Runner 请求状态。"""
+        pipeline = self.pipeline
+        assert pipeline is not None
+        try:
+            with self._model_execution_context():
+                with self._runtime_execution_context([state]):
+                    output = pipeline.finalize_vae_blocks(state)
+            attach_stage_durations(state, output)
+            return output
+        finally:
+            self.release_step_requests([state.request_id])
 
     def release_step_requests(self, request_ids: Sequence[str]) -> None:
         """Drop request-owned state after execution/output preparation has returned.
@@ -1505,9 +1630,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
     ) -> BatchRunnerOutput:
         """Run the denoise step after metadata admission and row installation."""
 
-        use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
+        with self._model_execution_context():
             pipeline = self.pipeline
             assert pipeline is not None, "Model not loaded. Call load_model() first."
             had_active_states = bool(self.state_cache)

@@ -258,6 +258,37 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_explicit_denoising_uses_inference_mode(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.runtime_providers = None
+    state = SimpleNamespace(request_id="req", denoise_completed=False)
+    runner.state_cache = {"req": state}
+    observed = {}
+
+    class Pipeline:
+        def denoise_step(self, input_batch, states):
+            del input_batch, states
+            observed["grad_enabled"] = torch.is_grad_enabled()
+            observed["inference_mode"] = torch.is_inference_mode_enabled()
+            return object()
+
+        def step_scheduler(self, step_state, noise_pred):
+            del step_state, noise_pred
+
+    runner.pipeline = Pipeline()
+    monkeypatch.setattr(InputBatch, "make_batch", lambda states: object())
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    runner.execute_explicit_denoising_step(state)
+
+    assert observed == {
+        "grad_enabled": False,
+        "inference_mode": True,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("imported_tokens", [None, (4, 4), (4, 2)])
 def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, imported_tokens):
     from contextlib import nullcontext

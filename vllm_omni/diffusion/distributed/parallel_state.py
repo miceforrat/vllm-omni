@@ -30,7 +30,10 @@ If you only need to use the distributed environment without model parallelism,
 """
 
 import inspect
+from contextlib import contextmanager
+from contextvars import ContextVar
 from math import prod
+from typing import Any, Iterator, Protocol
 
 import torch
 import torch.distributed
@@ -67,6 +70,36 @@ _HSDP_REPLICATE: GroupCoordinator | None = None  # HSDP replica dimension
 # it is reused by platform-specific runtimes that must build companion groups
 # with the same rank layout as vLLM EP.
 _EXPERT_PARALLEL_GROUP_RANKS: list[list[int]] | None = None
+
+
+class ParallelGroupProvider(Protocol):
+    """运行时提供的模型级并行组视图。"""
+
+    def get(self, parallel_dimension: str) -> Any | None: ...
+
+
+_PARALLEL_GROUP_PROVIDER: ContextVar[ParallelGroupProvider | None] = (
+    ContextVar("omni_parallel_group_provider", default=None)
+)
+
+
+@contextmanager
+def use_parallel_group_provider(
+    provider: ParallelGroupProvider,
+) -> Iterator[ParallelGroupProvider]:
+    """在当前执行上下文中优先使用外部提供的模型级通信组。"""
+    token = _PARALLEL_GROUP_PROVIDER.set(provider)
+    try:
+        yield provider
+    finally:
+        _PARALLEL_GROUP_PROVIDER.reset(token)
+
+
+def _get_provider_group(parallel_dimension: str) -> Any | None:
+    provider = _PARALLEL_GROUP_PROVIDER.get()
+    if provider is None:
+        return None
+    return provider.get(parallel_dimension)
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -246,12 +279,18 @@ class RankGenerator:
 
 # * QUERY
 def get_world_group() -> GroupCoordinator:
+    group = _get_provider_group("world")
+    if group is not None:
+        return group
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
 
 
 # SP
 def get_sp_group() -> SequenceParallelGroupCoordinator:
+    group = _get_provider_group("sp")
+    if group is not None:
+        return group
     assert _SP is not None, "pipeline model parallel group is not initialized"
     return _SP
 
@@ -297,6 +336,9 @@ def get_expert_parallel_group_ranks() -> list[list[int]]:
 
 # PP
 def get_pp_group() -> PipelineGroupCoordinator:
+    group = _get_provider_group("pp")
+    if group is not None:
+        return group
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
@@ -324,10 +366,13 @@ def is_pipeline_last_stage():
 # CFG
 def is_cfg_group_initialized() -> bool:
     """Return whether the classifier-free-guidance group has been created."""
-    return _CFG is not None
+    return _get_provider_group("cfg") is not None or _CFG is not None
 
 
 def get_cfg_group() -> GroupCoordinator:
+    group = _get_provider_group("cfg")
+    if group is not None:
+        return group
     assert _CFG is not None, "classifier_free_guidance parallel group is not initialized"
     return _CFG
 
@@ -344,6 +389,9 @@ def get_classifier_free_guidance_rank():
 
 # DP
 def get_dp_group() -> GroupCoordinator:
+    group = _get_provider_group("dp")
+    if group is not None:
+        return group
     assert _DP is not None, "pipeline model parallel group is not initialized"
     return _DP
 
@@ -360,11 +408,17 @@ def get_data_parallel_rank():
 
 # FS (Fully Shard / HSDP shard dimension)
 def get_fs_group() -> GroupCoordinator:
+    group = _get_provider_group("fs")
+    if group is not None:
+        return group
     assert _FS is not None, "fully shard group is not initialized"
     return _FS
 
 
 def get_hsdp_replicate_group() -> GroupCoordinator:
+    group = _get_provider_group("hsdp_replicate")
+    if group is not None:
+        return group
     assert _HSDP_REPLICATE is not None, "HSDP replicate group is not initialized"
     return _HSDP_REPLICATE
 
@@ -453,11 +507,14 @@ def init_distributed_environment(
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
     return (
-        _DP is not None
-        and _CFG is not None
-        and _SP is not None
-        and _PP is not None
-        and vllm_parallel_state._TP is not None
+        (_get_provider_group("dp") is not None or _DP is not None)
+        and (_get_provider_group("cfg") is not None or _CFG is not None)
+        and (_get_provider_group("sp") is not None or _SP is not None)
+        and (_get_provider_group("pp") is not None or _PP is not None)
+        and (
+            _get_provider_group("tp") is not None
+            or vllm_parallel_state._TP is not None
+        )
     )
 
 

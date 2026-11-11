@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +17,81 @@ requires_cosmos_framework = pytest.mark.skipif(
     not _FRAMEWORK_AVAILABLE,
     reason="cosmos_framework source is not present on PYTHONPATH",
 )
+
+
+def test_cosmos3_exposes_native_step_execution_protocol() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+    )
+    from vllm_omni.diffusion.models.interface import (
+        SupportsStepExecution,
+        supports_step_execution,
+    )
+
+    # 协议检查不需要加载权重；这里只验证 Cosmos3 已接入 Omni 原生接口。
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+
+    assert pipeline.supports_step_execution is True
+    assert supports_step_execution(pipeline) is True
+    assert isinstance(pipeline, SupportsStepExecution)
+
+
+def test_cosmos3_vae_blocks_match_unsplit_temporal_decode() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+    )
+
+    class FakeVAE:
+        dtype = torch.float32
+        use_tiling = False
+        tile_sample_min_height = 64
+        tile_sample_min_width = 64
+        spatial_compression_ratio = 8
+        config = SimpleNamespace(scaling_factor=1.0, patch_size=None)
+
+        def __init__(self) -> None:
+            self._feat_map = []
+            self._conv_idx = [0]
+
+        def clear_cache(self) -> None:
+            self._feat_map = []
+
+        def _execution_context(self):
+            return nullcontext()
+
+        @staticmethod
+        def post_quant_conv(value):
+            return value + 1
+
+        @staticmethod
+        def decoder(value, **_kwargs):
+            return value * 2
+
+        def decode(self, value, return_dict=False):
+            projected = self.post_quant_conv(value)
+            chunks = [
+                self.decoder(projected[:, :, index : index + 1])
+                for index in range(projected.shape[2])
+            ]
+            output = torch.cat(chunks, dim=2)
+            return (output,) if not return_dict else output
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    object.__setattr__(pipeline, "vae", FakeVAE())
+    latents = torch.randn(1, 4, 4, 2, 2)
+    state = SimpleNamespace(latents=latents.clone(), extra={})
+
+    expected = pipeline.vae.decode(latents, return_dict=False)[0]
+    pipeline.prepare_vae_blocks(state)
+    observed_boundaries = []
+    while True:
+        observed_boundaries.append(state.extra["vae_block_index"])
+        if pipeline.run_vae_block(state):
+            break
+    actual = torch.cat(state.extra["vae_decoded_chunks"], dim=2)
+
+    assert observed_boundaries == [0, 1, 2, 3]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_framework_preflight_checks_every_policy_symbol(monkeypatch) -> None:
