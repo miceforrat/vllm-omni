@@ -101,3 +101,14 @@ class SeaCacheBackend(CacheBackend):
         pipeline._cache_context_factory = hook.cache_context
         if verbose:
             logger.debug("SeaCache state refreshed")
+
+    def release_request(self, pipeline: Any, request_id: str) -> None:
+        transformer = getattr(pipeline, "transformer", None)
+        registry = getattr(transformer, "_hook_registry", None)
+        hook = (
+            registry.get_hook(SeaCacheRootHook._HOOK_NAME)
+            if registry is not None
+            else None
+        )
+        if isinstance(hook, SeaCacheRootHook):
+            hook.release_request(request_id)

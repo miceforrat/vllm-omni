@@ -213,6 +213,10 @@ class RunnerOutput(BaseRunnerOutput):
     request_id: str
     step_index: int | None = None
     finished: bool = False
+    # 模型无关的执行阶段。StepScheduler 用它区分 denoising 与后续 decode
+    # wave；cursor 是阶段内的单调进度（例如 VAE block 下标）。
+    phase: str = "denoising"
+    phase_cursor: int = 0
     result: DiffusionOutput | None = None
     async_output_id: str | None = None
     wait_for_interaction: StepWait | None = None

@@ -50,6 +50,12 @@ class StateManager:
     def reset(self) -> None:
         self._states.clear()
 
+    def release_contexts(self, prefix: str) -> None:
+        """释放一个请求拥有的全部命名 cache context。"""
+        for name in tuple(self._states):
+            if name == prefix or name.startswith(f"{prefix}:"):
+                self._states.pop(name, None)
+
 
 class ModelHook:
     """Base class for model hooks that can override a module's forward.

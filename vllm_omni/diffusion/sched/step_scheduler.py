@@ -28,6 +28,8 @@ logger = init_logger(__name__)
 class _StepProgress:
     current_step: int
     total_steps: int
+    phase: Literal["denoising", "vae"] = "denoising"
+    phase_cursor: int = 0
     interaction_generation: int = 0
     scheduled_interaction_generation: int = 0
     wait_deadline: float | None = None  # None: runnable; inf: indefinite wait.
@@ -35,7 +37,7 @@ class _StepProgress:
 
 
 class StepScheduler(BaseScheduler):
-    """Scheduler that advances each request by one denoise step per update."""
+    """按 wave 推进 denoise step 或后续 decode block。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -44,8 +46,15 @@ class StepScheduler(BaseScheduler):
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
 
-    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
-        return self._request_progress[state.request_id].wait_deadline is None
+    @property
+    def active_request_ids(self) -> tuple[str, ...]:
+        """返回仍由 scheduler 持有的请求。"""
+        return tuple(self._request_states)
+
+    def execution_phase(self, request_id: str) -> tuple[str, int]:
+        """返回请求当前模型阶段及阶段内 cursor。"""
+        progress = self._request_progress[request_id]
+        return progress.phase, progress.phase_cursor
 
     def get_execution_wait_timeout(self, now: float) -> float | None:
         deadlines = [p.wait_deadline for p in self._request_progress.values() if p.wait_deadline is not None]
@@ -117,11 +126,27 @@ class StepScheduler(BaseScheduler):
         is_first_step = self._request_progress[state.request_id].current_step == 0
         for request_id in self._running:
             running = self._request_states[request_id]
+            if self._request_progress[request_id].phase != "denoising":
+                return False
             if state.req.allow_mixed_step_phases and running.req.allow_mixed_step_phases:
                 continue
             if (self._request_progress[request_id].current_step == 0) != is_first_step:
                 return False
         return True
+
+    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
+        progress = self._request_progress[state.request_id]
+        if progress.wait_deadline is not None:
+            return False
+        # 以第一个 runnable 请求的阶段作为本轮阶段。不能简单要求所有 running
+        # 请求阶段相同，否则 denoise/vae 交界处会让双方都不可调度。
+        target_phase = None
+        for request_id in self._running:
+            other = self._request_progress[request_id]
+            if other.wait_deadline is None:
+                target_phase = other.phase
+                break
+        return target_phase is None or progress.phase == target_phase
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
@@ -165,9 +190,10 @@ class StepScheduler(BaseScheduler):
                 terminal_errors[request_id] = "Missing step_index in RunnerOutput"
                 continue
 
-            # We assume that the decoding stage is executed immediately after the denoising stage completes.
             progress.current_step = req_output.step_index
             state.req.sampling_params.step_index = req_output.step_index
+            progress.phase = req_output.phase
+            progress.phase_cursor = req_output.phase_cursor
             if req_output.finished:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[request_id] = None

@@ -111,6 +111,10 @@ class SeaCacheRootHook(ModelHook):
         finally:
             self.state_manager.set_context(previous_context)
 
+    def release_request(self, request_id: str) -> None:
+        """释放指定请求的 cond/uncond SeaCache 轨迹。"""
+        self.state_manager.release_contexts(str(request_id))
+
     def _build_indicator(
         self,
         vision_items: list[torch.Tensor] | None,

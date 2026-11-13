@@ -1253,7 +1253,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     )
                     if noise_pred is None:
                         raise RuntimeError(
-                            "Explicit Cosmos3 denoising returned no prediction"
+                            "Explicit diffusion denoising returned no prediction"
                         )
                     pipeline.step_scheduler(state, noise_pred)
         return state
@@ -1273,6 +1273,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         with self._model_execution_context():
             with self._runtime_execution_context([state]):
                 pipeline.prepare_vae_blocks(state)
+
+    def supports_explicit_vae_blocks(self) -> bool:
+        """返回当前 pipeline 是否提供可分块的显式 VAE decode。"""
+        pipeline = self.pipeline
+        return pipeline is not None and all(
+            callable(getattr(pipeline, name, None))
+            for name in (
+                "prepare_vae_blocks",
+                "run_vae_block",
+                "finalize_vae_blocks",
+            )
+        )
 
     def execute_explicit_vae_block(self, state: StepRequestState) -> bool:
         """推进一个 VAE temporal block，返回是否完成。"""
@@ -1297,6 +1309,29 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         finally:
             self.release_step_requests([state.request_id])
 
+    def execute_explicit_decode(
+        self, state: StepRequestState
+    ) -> DiffusionOutput:
+        """用通用 ``post_decode`` 完成不支持 VAE block 的 step-mode 请求。"""
+        if self.state_cache.get(state.request_id) is not state:
+            raise ValueError(
+                f"Unknown explicit request state {state.request_id!r}"
+            )
+        if not state.denoise_completed:
+            raise RuntimeError(
+                f"Request {state.request_id!r} has unfinished denoising"
+            )
+        pipeline = self.pipeline
+        assert pipeline is not None
+        try:
+            with self._model_execution_context():
+                with self._runtime_execution_context([state]):
+                    output = pipeline.post_decode(state)
+            attach_stage_durations(state, output)
+            return output
+        finally:
+            self.release_step_requests([state.request_id])
+
     def release_step_requests(self, request_ids: Sequence[str]) -> None:
         """Drop request-owned state after execution/output preparation has returned.
 
@@ -1306,6 +1341,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """
         for request_id in request_ids:
             state = self.state_cache.pop(request_id, None)
+            if self.cache_backend is not None:
+                self.cache_backend.release_request(
+                    self.pipeline, request_id
+                )
             release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
             if state is not None and callable(release):
                 release(state)
@@ -1507,9 +1546,82 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             [
                 state.request_id
                 for state in states
-                if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+                if interrupted
+                or state.request_id not in self.state_cache
+                or state.extra.get("_step_execution_finished", False)
+                or (
+                    state.request_denoise_completed
+                    and state.extra.get("_step_execution_phase") != "vae"
+                )
             ]
         )
+
+    def _execute_stepwise_decode_wave(
+        self,
+        states: list[StepRequestState],
+    ) -> BatchRunnerOutput:
+        """推进一轮 decode；支持 Cosmos3 每请求一个 VAE block。"""
+        pipeline = self.pipeline
+        assert pipeline is not None
+        outputs: list[RunnerOutput] = []
+        for state in states:
+            try:
+                cursor = int(state.extra.get("_step_vae_cursor", 0))
+                if self.supports_explicit_vae_blocks():
+                    if not state.extra.get("_step_vae_prepared", False):
+                        pipeline.prepare_vae_blocks(state)
+                        state.extra["_step_vae_prepared"] = True
+                    block_done = bool(pipeline.run_vae_block(state))
+                    cursor += 1
+                    state.extra["_step_vae_cursor"] = cursor
+                    result = (
+                        pipeline.finalize_vae_blocks(state)
+                        if block_done
+                        else None
+                    )
+                    finished = block_done
+                else:
+                    result = pipeline.post_decode(state)
+                    finished = True
+                    cursor = 1
+                if result is not None:
+                    result = self._prepare_output_for_transport(
+                        result, state.sampling
+                    )
+                    self._attach_stepwise_metadata(state, result)
+                    attach_stage_durations(state, result)
+                    if finished:
+                        self._maybe_send_stage_payload([state], [result])
+                if finished:
+                    state.extra["_step_execution_finished"] = True
+                outputs.append(
+                    RunnerOutput(
+                        request_id=state.request_id,
+                        step_index=state.step_index,
+                        finished=finished,
+                        phase="vae",
+                        phase_cursor=cursor,
+                        result=result,
+                    )
+                )
+            except Exception as exc:
+                self.state_cache.pop(state.request_id, None)
+                outputs.append(
+                    RunnerOutput(
+                        request_id=state.request_id,
+                        step_index=state.step_index,
+                        finished=True,
+                        phase="vae",
+                        phase_cursor=int(
+                            state.extra.get("_step_vae_cursor", 0)
+                        ),
+                        result=DiffusionOutput.from_exception(exc),
+                    )
+                )
+        self.release_step_requests(
+            [output.request_id for output in outputs if output.finished]
+        )
+        return BatchRunnerOutput.from_list(outputs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1597,8 +1709,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # Stepwise mode only supports the basic state-driven denoise path for now.
         # Request-mode extras such as cache backends, editing inputs, and
         # similar features are not supported here yet.
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
+        if self.od_config.cache_backend not in (None, "none", "sea_cache"):
+            raise ValueError(
+                "Step mode currently supports only request-scoped sea_cache; "
+                f"got cache_backend={self.od_config.cache_backend!r}."
+            )
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
@@ -1644,6 +1759,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
+            decode_states = [
+                state
+                for state in states
+                if state.extra.get("_step_execution_phase") == "vae"
+            ]
+            if decode_states:
+                if len(decode_states) != len(states):
+                    raise RuntimeError(
+                        "A stepwise Runner wave cannot mix denoising and VAE"
+                    )
+                return self._execute_stepwise_decode_wave(decode_states)
+
             states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
             if input_batch is None:
                 return BatchRunnerOutput.from_list(runner_output_list)
@@ -1701,27 +1828,61 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     streaming_media_duration = (
                                         cast(SupportsInteractionApply, pipeline).peek_chunk_media(req).duration_s
                                     )
-                                clear_pipeline_stage_durations(pipeline)
-                                result = pipeline.post_decode(req)
-                                if result is not None:
-                                    result = self._prepare_output_for_transport(result, req.sampling)
-                                    self._attach_stepwise_metadata(
-                                        req,
-                                        result,
-                                    )
-                                    if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
+                                if (
+                                    self.supports_explicit_vae_blocks()
+                                    and req.request_denoise_completed
+                                ):
+                                    # 只有显式声明 VAE block 接口的最终 decode
+                                    # 才进入后续 wave。其他 pipeline 保持 Omni
+                                    # 原有的同-wave post_decode 行为。
+                                    req.extra["_step_execution_phase"] = "vae"
+                                    result = None
+                                else:
+                                    clear_pipeline_stage_durations(pipeline)
+                                    result = pipeline.post_decode(req)
+                                    if result is not None:
+                                        result = self._prepare_output_for_transport(
+                                            result, req.sampling
+                                        )
+                                        self._attach_stepwise_metadata(
+                                            req, result
+                                        )
+                                    if (
+                                        supports_interaction_apply(pipeline)
+                                        and not req.request_denoise_completed
+                                    ):
+                                        if (
+                                            getattr(
+                                                req.sampling,
+                                                "streaming_buffer_seconds",
+                                                None,
+                                            )
+                                            is not None
+                                        ):
                                             req.pending_chunk_boundary = True
-                                            pipe = cast(SupportsInteractionApply, pipeline)
-                                            streaming_next_media_duration = pipe.peek_chunk_media(req).duration_s
+                                            pipe = cast(
+                                                SupportsInteractionApply,
+                                                pipeline,
+                                            )
+                                            streaming_next_media_duration = (
+                                                pipe.peek_chunk_media(req).duration_s
+                                            )
                                         else:
-                                            pipe = cast(SupportsInteractionApply, pipeline)
-                                            pipe.apply_interaction_at_chunk_boundary(req)
+                                            pipe = cast(
+                                                SupportsInteractionApply,
+                                                pipeline,
+                                            )
+                                            pipe.apply_interaction_at_chunk_boundary(
+                                                req
+                                            )
                                             pipe.prepare_next_chunk(req)
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
-                            finished = (
+                            deferred_decode = (
+                                req.extra.get("_step_execution_phase") == "vae"
+                            )
+                            finished = False if deferred_decode else (
                                 req.request_denoise_completed
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
@@ -1733,6 +1894,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     request_id=req.request_id,
                                     step_index=req.step_index,
                                     finished=finished,
+                                    phase=(
+                                        "vae"
+                                        if req.extra.get(
+                                            "_step_execution_phase"
+                                        ) == "vae"
+                                        else "denoising"
+                                    ),
+                                    phase_cursor=int(
+                                        req.extra.get("_step_vae_cursor", 0)
+                                    ),
                                     result=result,
                                     streaming_media_duration=streaming_media_duration,
                                     streaming_next_media_duration=streaming_next_media_duration,

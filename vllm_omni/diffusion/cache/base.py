@@ -100,6 +100,10 @@ class CacheBackend(ABC):
         """
         return self.enabled
 
+    def release_request(self, pipeline: Any, request_id: str) -> None:
+        """可选的请求级 cache 回收；默认 backend 没有请求私有状态。"""
+        del pipeline, request_id
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(config={self.config})"
 

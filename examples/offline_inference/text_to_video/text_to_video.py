@@ -328,6 +328,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable torch.compile and force eager execution.",
     )
     parser.add_argument(
+        "--step-execution",
+        action="store_true",
+        help="Use the pipeline's explicit prepare/denoise/scheduler/VAE path.",
+    )
+    parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
         help="Enable CPU offloading for diffusion models.",
@@ -562,6 +567,7 @@ def main():
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enforce_eager=args.enforce_eager,
+        step_execution=args.step_execution,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,

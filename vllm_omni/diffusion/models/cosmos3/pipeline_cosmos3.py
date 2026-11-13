@@ -4034,11 +4034,13 @@ class Cosmos3OmniDiffusersPipeline(
         """执行一个标准 Cosmos3 denoising forward。"""
         del kwargs
         states = tuple(states or input_batch.states)
-        if len(states) != 1:
-            raise ValueError(
-                "Cosmos3 step execution currently supports one request per batch"
-            )
-        state = states[0]
+        predictions = [self._denoise_request_step(state) for state in states]
+        if not predictions:
+            return None
+        return torch.cat(predictions, dim=0)
+
+    def _denoise_request_step(self, state: Any) -> torch.Tensor:
+        """推进 batch 中的一个请求；cache/KV 状态始终按 request 隔离。"""
         t = state.current_timestep
         if t is None or state.latents is None:
             raise RuntimeError("Cosmos3 step state has no runnable timestep")
@@ -4060,7 +4062,7 @@ class Cosmos3OmniDiffusersPipeline(
                 self.transformer.cached_freqs_gen,
             ) = state.extra["cond_cache"]
         noise_cond = self.predict_noise(
-            _cache_context="cond",
+            _cache_context=f"{state.request_id}:cond",
             text_ids=state.extra["cond_ids"],
             text_mask=state.extra["cond_mask"],
             **common,
@@ -4084,7 +4086,7 @@ class Cosmos3OmniDiffusersPipeline(
                 self.transformer.cached_freqs_gen,
             ) = state.extra["uncond_cache"]
         noise_uncond = self.predict_noise(
-            _cache_context="uncond",
+            _cache_context=f"{state.request_id}:uncond",
             text_ids=state.extra["uncond_ids"],
             text_mask=state.extra["uncond_mask"],
             **common,
