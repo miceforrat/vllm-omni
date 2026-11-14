@@ -94,6 +94,73 @@ def test_cosmos3_vae_blocks_match_unsplit_temporal_decode() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_cosmos3_vae_cache_is_isolated_between_requests() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+    )
+
+    class StatefulFakeVAE:
+        dtype = torch.float32
+        use_tiling = False
+        tile_sample_min_height = 64
+        tile_sample_min_width = 64
+        spatial_compression_ratio = 8
+        config = SimpleNamespace(scaling_factor=1.0, patch_size=None)
+
+        def __init__(self) -> None:
+            self._feat_map = []
+
+        def clear_cache(self) -> None:
+            self._feat_map = []
+
+        def _execution_context(self):
+            return nullcontext()
+
+        @staticmethod
+        def post_quant_conv(value):
+            return value
+
+        @staticmethod
+        def decoder(value, *, feat_cache, **_kwargs):
+            previous = feat_cache[0] if feat_cache else torch.zeros_like(value)
+            output = value + previous
+            if feat_cache:
+                feat_cache[0] = value
+            else:
+                feat_cache.append(value)
+            return output
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    object.__setattr__(pipeline, "vae", StatefulFakeVAE())
+    state_a = SimpleNamespace(
+        latents=torch.tensor([1.0, 2.0]).reshape(1, 1, 2, 1, 1),
+        extra={},
+    )
+    state_b = SimpleNamespace(
+        latents=torch.tensor([10.0, 20.0]).reshape(1, 1, 2, 1, 1),
+        extra={},
+    )
+
+    pipeline.prepare_vae_blocks(state_a)
+    pipeline.prepare_vae_blocks(state_b)
+    assert state_a.extra["vae_feat_map"] is not state_b.extra["vae_feat_map"]
+
+    # 模拟同一个 VAE wave 中两个请求交错推进。
+    assert pipeline.run_vae_block(state_a) is False
+    assert pipeline.run_vae_block(state_b) is False
+    assert pipeline.run_vae_block(state_a) is True
+    assert pipeline.run_vae_block(state_b) is True
+
+    output_a = torch.cat(state_a.extra["vae_decoded_chunks"], dim=2)
+    output_b = torch.cat(state_b.extra["vae_decoded_chunks"], dim=2)
+    torch.testing.assert_close(
+        output_a.flatten(), torch.tensor([1.0, 3.0]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        output_b.flatten(), torch.tensor([10.0, 30.0]), rtol=0, atol=0
+    )
+
+
 def test_framework_preflight_checks_every_policy_symbol(monkeypatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
 

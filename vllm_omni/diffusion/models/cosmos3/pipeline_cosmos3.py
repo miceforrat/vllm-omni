@@ -4153,12 +4153,17 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError(
                 "Explicit Cosmos3 vae_blocks do not yet support tiled decode"
             )
+        # Wan VAE 的 temporal convolution cache 原本挂在共享模型对象上。
+        # clear_cache() 会创建一套新的槽位；从这里开始将该列表交给请求
+        # state 持有，后续 block 不再读取共享的 self.vae._feat_map。
         self.vae.clear_cache()
+        feat_map = self.vae._feat_map
         with self.vae._execution_context():
             projected = self.vae.post_quant_conv(latents)
         state.extra.update(
             {
                 "vae_projected": projected,
+                "vae_feat_map": feat_map,
                 "vae_block_index": 0,
                 "vae_block_count": int(projected.shape[2]),
                 "vae_decoded_chunks": [],
@@ -4168,16 +4173,16 @@ class Cosmos3OmniDiffusersPipeline(
     def run_vae_block(self, state: Any) -> bool:
         """推进一个 temporal decoder block，返回 VAE 是否完成。"""
         projected = state.extra.get("vae_projected")
-        if projected is None:
+        feat_map = state.extra.get("vae_feat_map")
+        if projected is None or feat_map is None:
             raise RuntimeError("Cosmos3 VAE block state is not prepared")
         index = int(state.extra["vae_block_index"])
         count = int(state.extra["vae_block_count"])
         if index >= count:
             return True
-        self.vae._conv_idx = [0]
         kwargs: dict[str, Any] = {
-            "feat_cache": self.vae._feat_map,
-            "feat_idx": self.vae._conv_idx,
+            "feat_cache": feat_map,
+            "feat_idx": [0],
         }
         if index == 0:
             kwargs["first_chunk"] = True
@@ -4191,6 +4196,7 @@ class Cosmos3OmniDiffusersPipeline(
 
     def finalize_vae_blocks(self, state: Any) -> DiffusionOutput:
         """合并 VAE blocks、恢复输出格式并释放请求级缓存。"""
+        feat_map = state.extra.get("vae_feat_map")
         try:
             chunks = state.extra.get("vae_decoded_chunks")
             if not chunks or int(state.extra["vae_block_index"]) < int(
@@ -4216,7 +4222,16 @@ class Cosmos3OmniDiffusersPipeline(
                 ),
             )
         finally:
-            self.vae.clear_cache()
+            for key in (
+                "vae_feat_map",
+                "vae_projected",
+                "vae_decoded_chunks",
+            ):
+                state.extra.pop(key, None)
+            # 全局指针可能已被另一个请求的 prepare_vae_blocks 替换。只有
+            # 它仍指向当前请求时才能清理，不能破坏另一个请求的缓存。
+            if feat_map is not None and self.vae._feat_map is feat_map:
+                self.vae.clear_cache()
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             if state.extra.get("kv_state") is not None:
