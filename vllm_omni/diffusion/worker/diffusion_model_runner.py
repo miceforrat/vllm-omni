@@ -1352,6 +1352,38 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
             self.input_batch = None
 
+    def assert_request_state_isolated(self) -> None:
+        """断言 step 执行后没有请求状态遗留在共享 Pipeline 槽位。"""
+        states = tuple(self.state_cache.values())
+        request_owned_keys = (
+            "vae_feat_map",
+            "vae_decoded_chunks",
+            "cond_cache",
+            "uncond_cache",
+            "kv_state",
+        )
+        for key in request_owned_keys:
+            owners = []
+            for state in states:
+                value = state.extra.get(key)
+                if value is None:
+                    continue
+                if (
+                    isinstance(value, tuple)
+                    and not any(item is not None for item in value)
+                ):
+                    continue
+                owners.append(id(value))
+            if len(owners) != len(set(owners)):
+                raise RuntimeError(
+                    f"Step requests share mutable state slot {key!r}"
+                )
+        checker = getattr(
+            self.pipeline, "assert_step_request_state_isolated", None
+        )
+        if checker is not None:
+            checker()
+
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids

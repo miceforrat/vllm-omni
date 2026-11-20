@@ -2008,6 +2008,7 @@ class Cosmos3OmniDiffusersPipeline(
 
     def _clear_denoise_step_metadata(self) -> None:
         self._current_step_index = None
+        self._num_timesteps = None
         self._current_sigma = None
 
     def _set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
@@ -4034,7 +4035,18 @@ class Cosmos3OmniDiffusersPipeline(
         """执行一个标准 Cosmos3 denoising forward。"""
         del kwargs
         states = tuple(states or input_batch.states)
-        predictions = [self._denoise_request_step(state) for state in states]
+        try:
+            predictions = [
+                self._denoise_request_step(state) for state in states
+            ]
+        finally:
+            # 这些槽位只是算子执行期的临时 view。请求持久
+            # 状态已保存在 StepRequestState.extra，slice 返回前必须清空。
+            self._clear_denoise_step_metadata()
+            self._reset_mixed_precision()
+            self._guidance_scale = None
+            self.transformer.cached_kv = None
+            self.transformer.cached_freqs_gen = None
         if not predictions:
             return None
         return torch.cat(predictions, dim=0)
@@ -4158,6 +4170,10 @@ class Cosmos3OmniDiffusersPipeline(
         # state 持有，后续 block 不再读取共享的 self.vae._feat_map。
         self.vae.clear_cache()
         feat_map = self.vae._feat_map
+        # 共享 VAE 只用来创建缓存槽位；创建后立即转移给
+        # 请求 state，避免下一个请求覆盖共享指针。
+        self.vae._feat_map = None
+        self.vae._conv_idx = [0]
         with self.vae._execution_context():
             projected = self.vae.post_quant_conv(latents)
         state.extra.update(
@@ -4196,7 +4212,6 @@ class Cosmos3OmniDiffusersPipeline(
 
     def finalize_vae_blocks(self, state: Any) -> DiffusionOutput:
         """合并 VAE blocks、恢复输出格式并释放请求级缓存。"""
-        feat_map = state.extra.get("vae_feat_map")
         try:
             chunks = state.extra.get("vae_decoded_chunks")
             if not chunks or int(state.extra["vae_block_index"]) < int(
@@ -4228,14 +4243,27 @@ class Cosmos3OmniDiffusersPipeline(
                 "vae_decoded_chunks",
             ):
                 state.extra.pop(key, None)
-            # 全局指针可能已被另一个请求的 prepare_vae_blocks 替换。只有
-            # 它仍指向当前请求时才能清理，不能破坏另一个请求的缓存。
-            if feat_map is not None and self.vae._feat_map is feat_map:
-                self.vae.clear_cache()
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             if state.extra.get("kv_state") is not None:
                 self._memory_manager.drop_session(state.request_id)
+
+    def assert_step_request_state_isolated(self) -> None:
+        """断言 Cosmos3 共享模型对象不持有请求级状态。"""
+        feat_map = getattr(self.vae, "_feat_map", None)
+        if feat_map not in (None, []):
+            raise RuntimeError("Shared VAE retains a request feat cache")
+        if (
+            self._current_step_index is not None
+            or self._current_sigma is not None
+            or self._num_timesteps is not None
+            or self._guidance_scale is not None
+        ):
+            raise RuntimeError("Cosmos3 retains denoising step metadata")
+        if self.transformer.cached_kv is not None:
+            raise RuntimeError("Cosmos3 transformer retains request KV state")
+        if self.transformer.cached_freqs_gen is not None:
+            raise RuntimeError("Cosmos3 transformer retains request RoPE state")
 
     def post_decode(self, state: Any, **kwargs: Any) -> DiffusionOutput:
         """兼容 Omni 原生 step runner：连续消费全部 VAE blocks。"""

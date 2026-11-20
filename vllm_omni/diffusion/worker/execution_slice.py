@@ -74,6 +74,7 @@ class StepwiseDiffusionExecutionSliceSession:
         )
 
     def execute_slice(self) -> ExecutionSliceResult:
+        """这个函数为我们自建的slice提供实际的执行内容"""
         spec = self.next_slice()
         metadata = dict(spec.metadata)
 
